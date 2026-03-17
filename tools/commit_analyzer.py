@@ -33,6 +33,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 UPSTREAM_URL = "https://github.com/vllm-project/vllm.git"
+UPSTREAM_PR_URL = "https://github.com/vllm-project/vllm/pull"
 REMOTE_NAME = "vllm-oss"
 DEFAULT_FIRST_DATE = "2025-12-01"
 DINGTALK_FOLDER_URL = (
@@ -215,6 +216,14 @@ class GitManager:
         )
         return output.splitlines() if output else []
 
+    def get_commit_diff_stat(self, commit_hash: str) -> str:
+        """Get compact diff stat for a commit (files changed + insertions/deletions)."""
+        output = self._run(
+            "show", "--stat", "--format=", commit_hash,
+            check=False,
+        )
+        return output if output else ""
+
 
 # ---------------------------------------------------------------------------
 # CommitParser
@@ -269,6 +278,7 @@ class CommitParser:
         self,
         raw_commits: list[dict],
         check_files: bool = True,
+        collect_stats: bool = False,
     ) -> tuple[list[dict], dict[str, list[dict]]]:
         """Returns (multimodal_commits, other_commits_by_category)."""
         multimodal: list[dict] = []
@@ -294,12 +304,17 @@ class CommitParser:
                 commit["subject"], tags, changed_files
             )
 
+            diff_stat = ""
+            if collect_stats:
+                diff_stat = self.git.get_commit_diff_stat(commit["hash"])
+
             enriched = {
                 **commit,
                 "tags": tags,
                 "pr_number": pr,
                 "category": category,
                 "is_multimodal": is_mm,
+                "diff_stat": diff_stat,
             }
 
             if is_mm:
@@ -458,6 +473,124 @@ class LLMSummarizer:
 
         return result
 
+    def _build_commit_detail_text(self, commits: list[dict]) -> str:
+        """Build detailed text for per-commit analysis including diff stats."""
+        parts = []
+        for i, c in enumerate(commits, 1):
+            tags = "".join(f"[{t}]" for t in c["tags"]) if c["tags"] else ""
+            pr = f" (#{c['pr_number']})" if c["pr_number"] else ""
+            entry = f"### Commit {i}: {tags} {c['subject']}{pr}\n"
+            entry += f"日期: {c['date']} | 作者: {c['author_name']}\n"
+            if c.get("diff_stat"):
+                entry += f"变更概况:\n{c['diff_stat']}\n"
+            parts.append(entry)
+        return "\n---\n".join(parts)
+
+    def analyze_commits_batch(
+        self, commits: list[dict], context: str = "general"
+    ) -> dict[str, str]:
+        """Analyze a batch of commits, returning {hash: analysis} mapping."""
+        if not commits:
+            return {}
+
+        detail_text = self._build_commit_detail_text(commits)
+
+        hash_list = ", ".join(c["hash"][:9] for c in commits)
+
+        if context == "multimodal":
+            focus = (
+                "这些是多模态相关的提交。分析时重点关注：多模态能力的变化、"
+                "新模型支持、推理性能影响。"
+            )
+        else:
+            focus = "分析时重点关注：用户可见的功能变化和重要修复。"
+
+        system_prompt = (
+            "你是 vLLM 项目的技术分析师。请用中文逐条分析以下 git commits。\n"
+            f"{focus}\n\n"
+            "对每条 commit，输出以下格式（严格按格式，不要遗漏任何 commit）：\n\n"
+            f"[commit hash 前9位]\n"
+            "- **原因/目的**：（一句话说明为什么要做这个改动）\n"
+            "- **方法**：（简述改了什么、怎么改的）\n"
+            "- **效果**：（改动带来的效果或影响）\n\n"
+            "每条分析控制在 2-3 行，简洁明了。不要输出其他内容。"
+        )
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": detail_text},
+        ]
+        response = self._call_api(messages)
+
+        # Parse response into per-commit mapping
+        result: dict[str, str] = {}
+        current_hash = None
+        current_lines: list[str] = []
+
+        for line in response.splitlines():
+            line_stripped = line.strip()
+            # Check if this line starts a new commit analysis
+            # Match patterns like "[60c3d41]" or "60c3d41" at start of line
+            match = re.match(r"\[?([a-f0-9]{7,9})\]?", line_stripped)
+            if match:
+                candidate = match.group(1)
+                # Verify it's one of our commits
+                for c in commits:
+                    if c["hash"].startswith(candidate):
+                        # Save previous
+                        if current_hash and current_lines:
+                            result[current_hash] = "\n".join(current_lines)
+                        current_hash = c["hash"]
+                        current_lines = []
+                        break
+                else:
+                    # Not a known hash, add to current
+                    if current_hash:
+                        current_lines.append(line)
+            elif current_hash:
+                current_lines.append(line)
+
+        # Save last one
+        if current_hash and current_lines:
+            result[current_hash] = "\n".join(current_lines)
+
+        return result
+
+    def analyze_all_commits(
+        self,
+        multimodal_commits: list[dict],
+        other_commits_by_category: dict[str, list[dict]],
+    ) -> dict[str, str]:
+        """Analyze all commits individually. Returns {hash: analysis}."""
+        all_analyses: dict[str, str] = {}
+
+        # Multimodal commits
+        if multimodal_commits:
+            log.info(
+                "正在逐条分析多模态 commits (%d 条)...",
+                len(multimodal_commits),
+            )
+            for chunk in self._chunk_commits(multimodal_commits, 15):
+                batch_result = self.analyze_commits_batch(chunk, "multimodal")
+                all_analyses.update(batch_result)
+
+        # Other categories
+        for category in CATEGORY_ORDER:
+            if category == "多模态":
+                continue
+            commits = other_commits_by_category.get(category, [])
+            if not commits:
+                continue
+            log.info(
+                "正在逐条分析 [%s] commits (%d 条)...",
+                category, len(commits),
+            )
+            for chunk in self._chunk_commits(commits, 15):
+                batch_result = self.analyze_commits_batch(chunk, "general")
+                all_analyses.update(batch_result)
+
+        return all_analyses
+
 
 # ---------------------------------------------------------------------------
 # ReportBuilder
@@ -465,12 +598,37 @@ class LLMSummarizer:
 
 class ReportBuilder:
     @staticmethod
-    def _format_commit_list(commits: list[dict]) -> str:
+    def _format_commit_list(
+        commits: list[dict],
+        analyses: dict[str, str] | None = None,
+    ) -> str:
         lines = []
         for c in commits:
             short_hash = c["hash"][:9]
-            # subject already contains [Tags] and (#PR), no need to duplicate
-            lines.append(f"- `{short_hash}` {c['subject']}")
+            # Build PR link if available
+            pr = c.get("pr_number")
+            if pr:
+                pr_link = f"[#{pr}]({UPSTREAM_PR_URL}/{pr})"
+                # Replace (#NNNNN) in subject with linked version
+                display = re.sub(
+                    r"\(#" + re.escape(pr) + r"\)\s*$",
+                    f"({pr_link})",
+                    c["subject"],
+                )
+            else:
+                display = c["subject"]
+
+            lines.append(f"- `{short_hash}` {display}")
+
+            # Add per-commit analysis if available
+            if analyses and c["hash"] in analyses:
+                analysis = analyses[c["hash"]].strip()
+                # Indent each line of analysis as block quote
+                for aline in analysis.splitlines():
+                    aline = aline.strip()
+                    if aline:
+                        lines.append(f"  > {aline}")
+
         return "\n".join(lines)
 
     def build(
@@ -480,6 +638,7 @@ class ReportBuilder:
         multimodal_commits: list[dict],
         other_commits_by_category: dict[str, list[dict]],
         summaries: dict[str, str],
+        analyses: dict[str, str] | None = None,
     ) -> str:
         total = len(multimodal_commits) + sum(
             len(v) for v in other_commits_by_category.values()
@@ -513,7 +672,9 @@ class ReportBuilder:
                 parts.append("")
             parts.append("### Commit 列表")
             parts.append("")
-            parts.append(self._format_commit_list(multimodal_commits))
+            parts.append(self._format_commit_list(
+                multimodal_commits, analyses,
+            ))
             parts.append("")
             parts.append("---")
             parts.append("")
@@ -534,7 +695,7 @@ class ReportBuilder:
                 parts.append("")
             parts.append("### Commit 列表")
             parts.append("")
-            parts.append(self._format_commit_list(commits))
+            parts.append(self._format_commit_list(commits, analyses))
             parts.append("")
             parts.append("---")
             parts.append("")
@@ -726,8 +887,12 @@ def main() -> None:
     # Parse & categorize
     parser = CommitParser(git)
     log.info("正在解析和分类 commits...")
+    dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "")
+    use_llm = not args.no_llm and bool(dashscope_key)
     mm_commits, other_by_cat = parser.process_commits(
-        raw_commits, check_files=not args.no_file_check
+        raw_commits,
+        check_files=not args.no_file_check,
+        collect_stats=use_llm,
     )
     log.info(
         "多模态: %d 条, 其他: %d 条 (%d 个分类)",
@@ -738,18 +903,19 @@ def main() -> None:
 
     # LLM summarization
     summaries: dict[str, str] = {}
-    dashscope_key = os.environ.get("DASHSCOPE_API_KEY", "")
+    analyses: dict[str, str] = {}
     if args.no_llm or not dashscope_key:
         if not args.no_llm and not dashscope_key:
             log.warning("DASHSCOPE_API_KEY 未设置，降级为 no-llm 模式")
     else:
         summarizer = LLMSummarizer(dashscope_key)
         summaries = summarizer.summarize_all(mm_commits, other_by_cat)
+        analyses = summarizer.analyze_all_commits(mm_commits, other_by_cat)
 
     # Build report
     builder = ReportBuilder()
     report = builder.build(
-        start_date, end_date, mm_commits, other_by_cat, summaries
+        start_date, end_date, mm_commits, other_by_cat, summaries, analyses
     )
 
     # Save locally
